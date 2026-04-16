@@ -241,11 +241,16 @@ select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/
   <div class="view" id="view-admin">
     <div class="seclbl">Settings</div>
     <div class="card">
-      <div class="clabel">Google Sheets Connection</div>
+      <div class="clabel">GitHub Connection</div>
       <div id="syncbadge"></div>
+      <p style="font-size:13px;color:var(--text3);margin-bottom:12px;">Stores all leads in a private GitHub repo — every device shares the same data in real time.</p>
       <div class="fld">
-        <label>Apps Script URL</label>
-        <input type="text" id="scripturl-input" placeholder="https://script.google.com/macros/s/..." autocomplete="off" autocorrect="off" spellcheck="false">
+        <label>GitHub Repo (owner/repo)</label>
+        <input type="text" id="ghrepo-input" placeholder="e.g. becca-lee/elc-data" autocomplete="off" autocorrect="off" spellcheck="false">
+      </div>
+      <div class="fld" style="margin-top:11px;">
+        <label>Personal Access Token</label>
+        <input type="text" id="ghtoken-input" placeholder="github_pat_..." autocomplete="off" autocorrect="off" spellcheck="false">
       </div>
       <button class="btn btnp btnfull" style="margin-top:12px;" id="saveurlbtn">Save &amp; Connect</button>
       <div class="divider"></div>
@@ -379,7 +384,7 @@ select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/
 </div>
 
 <script>
-var S = { apiKey:'', scriptUrl:'', events:[], leads:[], users:[] };
+var S = { apiKey:'', ghToken:'', ghRepo:'', events:[], leads:[], users:[] };
 var currentUser = null;
 var editId=null, curEvId=null, answers={}, selFile=null, qCount=0;
 
@@ -389,7 +394,8 @@ function loadLocal() {
   if(!S.leads)   S.leads   = [];
   if(!S.users)   S.users   = [];
   if(!S.apiKey)  S.apiKey  = '';
-  if(!S.scriptUrl) S.scriptUrl = '';
+  if(!S.ghToken) S.ghToken = '';
+  if(!S.ghRepo)  S.ghRepo  = '';
   // Restore session
   try { var u=sessionStorage.getItem('elc_user'); if(u) currentUser=JSON.parse(u); } catch(e){}
 }
@@ -400,41 +406,91 @@ function saveSession() {
   try { sessionStorage.setItem('elc_user', JSON.stringify(currentUser)); } catch(e){}
 }
 
-// ── SHEETS ────────────────────────────────────────────────
-function sheetsPost(payload) {
-  if(!S.scriptUrl) return Promise.reject(new Error('No script URL'));
-  return fetch(S.scriptUrl, { method:'POST', mode:'no-cors', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) })
-    .then(function(){ return {ok:true}; });
+// -- GITHUB BACKEND ----------------------------------------
+// Stores all data in a single JSON file in a private GitHub repo.
+// All devices read/write the same file -- full shared state.
+
+var GH_FILE = 'elc-data.json';
+
+function ghHeaders() {
+  return {
+    'Authorization': 'Bearer ' + S.ghToken,
+    'Accept':        'application/vnd.github+json',
+    'Content-Type':  'application/json'
+  };
 }
-function sheetsGet(params) {
-  if(!S.scriptUrl) return Promise.reject(new Error('No script URL'));
-  return new Promise(function(resolve, reject) {
-    var cbName = 'elc_cb_' + Date.now();
-    var script = document.createElement('script');
-    var timer = setTimeout(function() { cleanup(); reject(new Error('Timeout')); }, 12000);
-    function cleanup() {
-      clearTimeout(timer);
-      delete window[cbName];
-      if(script.parentNode) script.parentNode.removeChild(script);
-    }
-    window[cbName] = function(data) { cleanup(); resolve(data); };
-    script.src = S.scriptUrl + '?action=' + (params||'getAll') + '&callback=' + cbName;
-    script.onerror = function() { cleanup(); reject(new Error('Load failed')); };
-    document.head.appendChild(script);
-  });
+
+function ghUrl() {
+  return 'https://api.github.com/repos/' + S.ghRepo + '/contents/' + GH_FILE;
 }
 
 function syncFromSheets() {
-  setSyncStatus('ing','Syncing...');
-  return sheetsGet('getAll').then(function(data) {
-    if(data.events) S.events = data.events;
-    if(data.leads)  S.leads  = data.leads;
-    if(data.users)  S.users  = data.users;
-    saveLocal();
-    setSyncStatus('ok','Synced with Google Sheets');
-    renderScan();
-    if(currentUser && currentUser.role==='admin') { renderAdmin(); }
-  }).catch(function(){ setSyncStatus('no','Offline — using local data'); });
+  if(!S.ghToken || !S.ghRepo) {
+    setSyncStatus('no', 'Add your GitHub Token and Repo in Settings');
+    return Promise.resolve();
+  }
+  setSyncStatus('ing', 'Syncing...');
+  return fetch(ghUrl(), { headers: ghHeaders() })
+    .then(function(r) {
+      if(r.status === 404) {
+        // File does not exist yet - create it
+        return createGhFile().then(function() { return { content: btoa('{}') }; });
+      }
+      return r.json();
+    })
+    .then(function(d) {
+      var raw = d.content ? atob(d.content.replace(/\n/g,'')) : '{}';
+
+      var rec = JSON.parse(raw);
+      if(rec.events) S.events = rec.events;
+      if(rec.leads)  S.leads  = rec.leads;
+      if(rec.users)  S.users  = rec.users;
+      // Store the SHA so we can update the file later
+      if(d.sha) S._ghSha = d.sha;
+      saveLocal();
+      setSyncStatus('ok', 'Synced - ' + S.leads.length + ' leads');
+      renderScan();
+      if(currentUser && currentUser.role==='admin') renderAdmin();
+    })
+    .catch(function(e) {
+      console.warn('Sync error:', e.message);
+      setSyncStatus('no', 'Offline - using local data');
+    });
+}
+
+function pushToCloud() {
+  if(!S.ghToken || !S.ghRepo) return Promise.resolve();
+  var content = btoa(unescape(encodeURIComponent(
+    JSON.stringify({ events: S.events, leads: S.leads, users: S.users }, null, 2)
+  )));
+  var body = {
+    message: 'update leads',
+    content: content
+  };
+  if(S._ghSha) body.sha = S._ghSha;
+  return fetch(ghUrl(), {
+    method:  'PUT',
+    headers: ghHeaders(),
+    body:    JSON.stringify(body)
+  }).then(function(r) { return r.json(); })
+    .then(function(d) {
+      if(d.content && d.content.sha) S._ghSha = d.content.sha;
+      saveLocal();
+    });
+}
+
+function createGhFile() {
+  var content = btoa('{}');
+  return fetch(ghUrl(), {
+    method:  'PUT',
+    headers: ghHeaders(),
+    body:    JSON.stringify({ message: 'init data file', content: content })
+  }).then(function(r) { return r.json(); })
+    .then(function(d) { if(d.content && d.content.sha) S._ghSha = d.content.sha; });
+}
+
+function sheetsPost(payload) {
+  return Promise.resolve({ok:true});
 }
 
 function setSyncStatus(state, msg) {
@@ -444,7 +500,7 @@ function setSyncStatus(state, msg) {
   el.innerHTML = '<div class="sync-bar '+cls+'">'+icon+msg+'</div>';
 }
 
-// ── LOGIN ─────────────────────────────────────────────────
+// -- LOGIN -------------------------------------------------
 function initAuth() {
   if(currentUser) { showApp(); return; }
   document.getElementById('loginscreen').classList.remove('hidden');
@@ -459,16 +515,11 @@ function doLogin() {
   if(!email || !email.includes('@')) { errEl.textContent='Please enter a valid email address.'; return; }
 
   var btn = document.getElementById('login-btn');
-  btn.disabled=true; checkEl.style.display='flex';
+  btn.disabled=true;
 
-  // Try Sheets first, fall back to local cache
-  sheetsGet('getUsers').then(function(data) {
-    if(data.users) { S.users=data.users; saveLocal(); }
-    checkAccess(email, errEl, checkEl, btn);
-  }).catch(function() {
-    // Offline — check local cache
-    checkAccess(email, errEl, checkEl, btn);
-  });
+  // Always check locally first - no remote call at login
+  // Remote sync happens after login in showApp()
+  checkAccess(email, errEl, checkEl, btn);
 }
 
 function checkAccess(email, errEl, checkEl, btn) {
@@ -482,7 +533,7 @@ function checkAccess(email, errEl, checkEl, btn) {
     // Show a setup notice in admin
     setTimeout(function(){
       var el = document.getElementById('syncbadge');
-      if(el) el.innerHTML = '<div class="sync-bar sync-no"><div class="doty"></div>First-time setup: add your Apps Script URL and users below, then others can log in.</div>';
+      if(el) el.innerHTML = '<div class="sync-bar sync-no"><div class="doty"></div>First-time setup: add your GitHub Token and Repo in Settings, then add users below.</div>';
     }, 500);
     return;
   }
@@ -501,7 +552,7 @@ function showApp() {
   document.getElementById('loginscreen').classList.add('hidden');
   document.getElementById('mainapp').style.display='flex';
   var pill = document.getElementById('role-pill');
-  pill.textContent = currentUser.name + ' · ' + (currentUser.role==='admin'?'Admin':'Scanner');
+  pill.textContent = currentUser.name + ' . ' + (currentUser.role==='admin'?'Admin':'Scanner');
   if(currentUser.role==='admin') {
     document.getElementById('admintabs').style.display='flex';
     document.getElementById('scantabs').style.display='none';
@@ -509,7 +560,7 @@ function showApp() {
     document.getElementById('admintabs').style.display='none';
     document.getElementById('scantabs').style.display='flex';
   }
-  if(S.scriptUrl) syncFromSheets();
+  if(S.ghToken && S.ghRepo) syncFromSheets();
   renderScan();
 }
 
@@ -522,7 +573,7 @@ function signOut() {
   document.getElementById('mainapp').style.display='none';
 }
 
-// ── TABS ──────────────────────────────────────────────────
+// -- TABS --------------------------------------------------
 function goTab(t) {
   document.getElementById('view-scan').classList.remove('on');
   document.getElementById('view-admin').classList.remove('on');
@@ -533,7 +584,7 @@ function goTab(t) {
   if(t==='admin') renderAdmin();
 }
 
-// ── SCANNER ───────────────────────────────────────────────
+// -- SCANNER -----------------------------------------------
 function renderScan() {
   var wrap=document.getElementById('evselectwrap');
   if(!S.events.length) {
@@ -542,7 +593,7 @@ function renderScan() {
     h('uploadcard',1); return;
   }
   var html='<select id="evsel"><option value="">Choose an event</option>';
-  S.events.slice().reverse().forEach(function(e){ html+='<option value="'+e.id+'"'+(e.id===curEvId?' selected':'')+'>'+xh(e.name)+(e.meta?' · '+xh(e.meta):'')+' </option>'; });
+  S.events.slice().reverse().forEach(function(e){ html+='<option value="'+e.id+'"'+(e.id===curEvId?' selected':'')+'>'+xh(e.name)+(e.meta?' . '+xh(e.meta):'')+' </option>'; });
   wrap.innerHTML=html+'</select>';
   document.getElementById('evsel').onchange=function(){ onEvChange(this.value); };
 }
@@ -630,7 +681,7 @@ function saveLead() {
   S.leads.push(lead); saveLocal();
   var btn=document.getElementById('submitbtn');
   btn.disabled=true; btn.innerHTML='<div class="spin"></div> Saving...';
-  sheetsPost({action:'saveLead',lead:lead}).finally(function(){
+  pushToCloud().finally(function(){
     btn.disabled=false; btn.innerHTML='Save Lead';
     var name=[first,last].filter(Boolean).join(' ')||email||'Contact';
     document.getElementById('okmsg').textContent=name+' added to '+(ev?ev.name:'this event')+'.';
@@ -650,12 +701,13 @@ function setStep(n) {
   ['s1','s2','s3','s4'].forEach(function(id,i){ var el=document.getElementById(id); el.className='seg'+(i+1<n?' done':i+1===n?' now':''); });
 }
 
-// ── ADMIN ─────────────────────────────────────────────────
+// -- ADMIN -------------------------------------------------
 function renderAdmin() {
-  if(!document.getElementById('syncbadge').innerHTML) setSyncStatus('no', S.scriptUrl?'Not yet synced':'No Apps Script URL — add below');
-  document.getElementById('scripturl-input').value = S.scriptUrl ? '...'+S.scriptUrl.slice(-30) : '';
+  if(!document.getElementById('syncbadge').innerHTML) setSyncStatus('no', (S.ghToken&&S.ghRepo)?'Not yet synced':'Add your GitHub Token and Repo below');
+  document.getElementById('ghrepo-input').value  = S.ghRepo  || '';
+  document.getElementById('ghtoken-input').value = S.ghToken ? '...'+S.ghToken.slice(-6) : '';
   var hasKey=S.apiKey&&S.apiKey.startsWith('sk-ant');
-  document.getElementById('apibadge').innerHTML='<div class="apirow '+(hasKey?'apiok':'apino')+'"><div class="'+(hasKey?'dotg':'doty')+'"></div>'+(hasKey?'API key configured':'No API key — extraction will be manual')+'</div>';
+  document.getElementById('apibadge').innerHTML='<div class="apirow '+(hasKey?'apiok':'apino')+'"><div class="'+(hasKey?'dotg':'doty')+'"></div>'+(hasKey?'API key configured':'No API key -- extraction will be manual')+'</div>';
   document.getElementById('apiinput').value='';
   renderUsersList(); renderEvList(); renderLeads(); renderLeadFilter();
 }
@@ -675,7 +727,7 @@ function removeUser(idx) {
   var u=S.users[idx]; if(!u) return;
   if(!confirm('Remove '+u.email+' from the team?')) return;
   S.users.splice(idx,1); saveLocal();
-  sheetsPost({action:'saveUsers',users:S.users}).catch(function(){});
+  pushToCloud().catch(function(){});
   renderUsersList();
 }
 
@@ -684,7 +736,7 @@ function renderEvList() {
   if(!S.events.length){ el.innerHTML='<p style="font-size:13px;color:var(--text3);text-align:center;padding:16px 0">No events yet.</p>'; return; }
   el.innerHTML=S.events.map(function(ev){
     var n=S.leads.filter(function(l){return l.eventId===ev.id;}).length;
-    return '<div class="evrow"><div class="evdot"></div><div class="evinfo"><h4>'+xh(ev.name)+'</h4><span>'+(ev.meta?xh(ev.meta)+' · ':'')+n+' lead'+(n!==1?'s':'')+' · '+ev.questions.length+' question'+(ev.questions.length!==1?'s':'')+'</span></div><div class="evbtns"><button class="btnico" data-evid="'+ev.id+'" data-action="edit"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4Z"/></svg></button><button class="btnico bticdel" data-evid="'+ev.id+'" data-action="del"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg></button></div></div>';
+    return '<div class="evrow"><div class="evdot"></div><div class="evinfo"><h4>'+xh(ev.name)+'</h4><span>'+(ev.meta?xh(ev.meta)+' . ':'')+n+' lead'+(n!==1?'s':'')+' . '+ev.questions.length+' question'+(ev.questions.length!==1?'s':'')+'</span></div><div class="evbtns"><button class="btnico" data-evid="'+ev.id+'" data-action="edit"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4Z"/></svg></button><button class="btnico bticdel" data-evid="'+ev.id+'" data-action="del"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg></button></div></div>';
   }).join('');
   el.querySelectorAll('[data-action]').forEach(function(btn){ btn.onclick=function(){ var id=this.dataset.evid,act=this.dataset.action; if(act==='edit') openEdit(id); else delEv(id); }; });
 }
@@ -702,17 +754,22 @@ function renderLeads() {
   var wrap=document.getElementById('leadswrap');
   if(!leads.length){ wrap.innerHTML='<div class="emptymsg">No leads yet.</div>'; return; }
   wrap.innerHTML='<div class="leadslist">'+[...leads].reverse().map(function(l){
-    var name=[l.firstName,l.lastName].filter(Boolean).join(' ')||'—';
+    var name=[l.firstName,l.lastName].filter(Boolean).join(' ')||'--';
     var qTags=Object.keys(l).filter(function(k){return k.startsWith('q')&&l[k];}).map(function(k){return '<span class="tag">'+xh(l[k])+'</span>';}).join('');
     var byTag=l.scannedBy?'<span class="tag">'+xh(l.scannedBy)+'</span>':'';
-    return '<div class="leadcard"><div class="leadname">'+xh(name)+'</div><div class="leademail">'+xh(l.email||'—')+'</div><div class="leadsub">'+xh(l.company||'')+(l.company&&l.title?' · ':'')+xh(l.title||'')+(l.company||l.title?'  ·  ':'')+xh(l.date||'')+'</div>'+(qTags||byTag?'<div class="tagrow">'+qTags+byTag+'</div>':'')+'</div>';
+    return '<div class="leadcard"><div class="leadname">'+xh(name)+'</div><div class="leademail">'+xh(l.email||'--')+'</div><div class="leadsub">'+xh(l.company||'')+(l.company&&l.title?' . ':'')+xh(l.title||'')+(l.company||l.title?'  .  ':'')+xh(l.date||'')+'</div>'+(qTags||byTag?'<div class="tagrow">'+qTags+byTag+'</div>':'')+'</div>';
   }).join('')+'</div>';
 }
 
 function saveUrl() {
-  var raw=document.getElementById('scripturl-input').value.trim();
-  if(!raw||raw.startsWith('...')) return;
-  S.scriptUrl=raw; saveLocal(); syncFromSheets();
+  var repo  = document.getElementById('ghrepo-input').value.trim();
+  var token = document.getElementById('ghtoken-input').value.trim();
+  if(!repo || !token) { alert('Please enter both the GitHub Repo and Personal Access Token.'); return; }
+  S.ghRepo  = repo;
+  S.ghToken = token;
+  S._ghSha  = null;
+  saveLocal();
+  syncFromSheets();
 }
 
 function saveKey() {
@@ -728,11 +785,11 @@ function delEv(id) {
   S.events=S.events.filter(function(e){return e.id!==id;});
   if(curEvId===id){curEvId=null;resetScan();}
   saveLocal();
-  sheetsPost({action:'deleteEvent',eventId:id}).catch(function(){});
+  pushToCloud().catch(function(){});
   renderAdmin(); renderScan();
 }
 
-// ── USER MODAL ────────────────────────────────────────────
+// -- USER MODAL --------------------------------------------
 function openUserModal() {
   document.getElementById('newuser-email').value='';
   document.getElementById('newuser-role').value='scanner';
@@ -748,11 +805,11 @@ function saveUser() {
   if(S.users.find(function(u){return u.email===email;})){ alert('This email is already in the list.'); return; }
   S.users.push({email:email,role:role,name:name});
   saveLocal();
-  sheetsPost({action:'saveUsers',users:S.users}).catch(function(){});
+  pushToCloud().catch(function(){});
   closeUserModal(); renderUsersList();
 }
 
-// ── EVENT MODAL ───────────────────────────────────────────
+// -- EVENT MODAL -------------------------------------------
 function openCreate() {
   editId=null; document.getElementById('mtitle').textContent='New Event';
   document.getElementById('mname').value=''; document.getElementById('mmeta').value='';
@@ -806,11 +863,11 @@ function saveEvent() {
   if(editId){var idx=S.events.findIndex(function(e){return e.id===editId;}); if(idx>=0) S.events[idx]=ev;}
   else S.events.push(ev);
   saveLocal();
-  sheetsPost({action:'saveEvent',event:ev}).catch(function(){});
+  pushToCloud().catch(function(){});
   closeModal(); renderAdmin(); renderScan();
 }
 
-// ── CSV EXPORT ────────────────────────────────────────────
+// -- CSV EXPORT --------------------------------------------
 function exportCSV() {
   var f=document.getElementById('leadfilter').value;
   var leads=f==='all'?S.leads:S.leads.filter(function(l){return l.eventId===f;});
@@ -828,14 +885,14 @@ function exportCSV() {
   a.href=url;a.download=fname;a.click();URL.revokeObjectURL(url);
 }
 
-// ── UTILS ─────────────────────────────────────────────────
+// -- UTILS -------------------------------------------------
 function h(id,hide){var el=document.getElementById(id);if(el)el.hidden=!!hide;}
 function v(id){return(document.getElementById(id)?document.getElementById(id).value:'').trim();}
 function xh(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function xa(s){return String(s||'').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function toB64(file){return new Promise(function(res,rej){var r=new FileReader();r.onload=function(){res(r.result.split(',')[1]);};r.onerror=rej;r.readAsDataURL(file);});}
 
-// ── BOOT ──────────────────────────────────────────────────
+// -- BOOT --------------------------------------------------
 document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('login-btn').onclick=doLogin;
   document.getElementById('login-email').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});
