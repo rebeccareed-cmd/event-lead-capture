@@ -2,6 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Event Lead Capture</title>
@@ -243,7 +246,7 @@ select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/
     <div class="card">
       <div class="clabel">GitHub Connection</div>
       <div id="syncbadge"></div>
-      <p style="font-size:13px;color:var(--text3);margin-bottom:12px;">Stores all leads in a private GitHub repo — every device shares the same data in real time.</p>
+      <p style="font-size:13px;color:var(--text3);margin-bottom:12px;">All leads sync to GitHub in real time across every device.</p>
       <div class="fld">
         <label>GitHub Repo (owner/repo)</label>
         <input type="text" id="ghrepo-input" placeholder="e.g. becca-lee/elc-data" autocomplete="off" autocorrect="off" spellcheck="false">
@@ -384,7 +387,24 @@ select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/
 </div>
 
 <script>
-var S = { apiKey:'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', ghToken:'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', ghRepo:'rebeccareed-cmd/elc-data', events:[], leads:[], users:[] };
+// ============================================================
+// CONFIGURATION -- fill these in before uploading to GitHub
+// ============================================================
+var ANTHROPIC_KEY = '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';
+var GH_TOKEN      = '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';
+var GH_REPO       = 'rebeccareed-cmd/elc-data';
+var ADMIN_EMAIL   = 'rebecca.reed@overstory.com';
+var ADMIN_NAME    = 'Becca Reed';
+// ============================================================
+
+var S = {
+  apiKey:   ANTHROPIC_KEY,
+  ghToken:  GH_TOKEN,
+  ghRepo:   GH_REPO,
+  events:   [],
+  leads:    [],
+  users:    [{ email: ADMIN_EMAIL, role: 'admin', name: ADMIN_NAME }]
+};
 var currentUser = null;
 var editId=null, curEvId=null, answers={}, selFile=null, qCount=0;
 
@@ -394,8 +414,9 @@ function loadLocal() {
   if(!S.leads)   S.leads   = [];
   if(!S.users)   S.users   = [];
   if(!S.apiKey)  S.apiKey  = '';
-  if(!S.ghToken) S.ghToken = '';
-  if(!S.ghRepo)  S.ghRepo  = '';
+  if(!S.ghToken) S.ghToken = GH_TOKEN;
+  if(!S.ghRepo)  S.ghRepo  = GH_REPO;
+  if(!S.apiKey)  S.apiKey  = ANTHROPIC_KEY;
   // Restore session
   try { var u=sessionStorage.getItem('elc_user'); if(u) currentUser=JSON.parse(u); } catch(e){}
 }
@@ -561,16 +582,11 @@ function doLogin() {
 function checkAccess(email, errEl, checkEl, btn) {
   btn.disabled=false; checkEl.style.display='none';
 
-  // First-time setup: if no users exist yet, let anyone in as admin to configure the app
+  // First-time setup fallback
   if(S.users.length === 0) {
     currentUser = { email:email, name:email.split('@')[0], role:'admin' };
     saveSession();
     showApp();
-    // Show a setup notice in admin
-    setTimeout(function(){
-      var el = document.getElementById('syncbadge');
-      if(el) el.innerHTML = '<div class="sync-bar sync-no"><div class="doty"></div>First-time setup: add your GitHub Token and Repo in Settings, then add users below.</div>';
-    }, 500);
     return;
   }
 
