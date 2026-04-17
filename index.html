@@ -503,8 +503,34 @@ function setSyncStatus(state, msg) {
 // -- LOGIN -------------------------------------------------
 function initAuth() {
   if(currentUser) { showApp(); return; }
+  // Show login screen
   document.getElementById('loginscreen').classList.remove('hidden');
   document.getElementById('mainapp').style.display='none';
+  // Silently pre-fetch users list in background so login works immediately
+  if(S.ghToken && S.ghRepo) {
+    fetchUsersFromGitHub().then(function(users) {
+      if(users && users.length) { S.users = users; saveLocal(); }
+    }).catch(function(){});
+  }
+}
+
+function fetchUsersFromGitHub() {
+  var url = 'https://api.github.com/repos/' + S.ghRepo + '/contents/elc-data.json';
+  return fetch(url, {
+    headers: {
+      'Authorization': 'Bearer ' + S.ghToken,
+      'Accept': 'application/vnd.github+json'
+    }
+  }).then(function(r) {
+    if(!r.ok) return null;
+    return r.json();
+  }).then(function(d) {
+    if(!d || !d.content) return null;
+    var raw = atob(d.content.replace(/\n/g,''));
+    var rec = JSON.parse(raw);
+    if(rec.sha) S._ghSha = rec.sha;
+    return rec.users || null;
+  });
 }
 
 function doLogin() {
@@ -515,11 +541,21 @@ function doLogin() {
   if(!email || !email.includes('@')) { errEl.textContent='Please enter a valid email address.'; return; }
 
   var btn = document.getElementById('login-btn');
-  btn.disabled=true;
+  btn.disabled=true; checkEl.style.display='flex';
 
-  // Always check locally first - no remote call at login
-  // Remote sync happens after login in showApp()
-  checkAccess(email, errEl, checkEl, btn);
+  // If GitHub is configured, fetch fresh users list then check access
+  // This ensures newly added/removed users are always current
+  if(S.ghToken && S.ghRepo) {
+    fetchUsersFromGitHub().then(function(users) {
+      if(users && users.length) { S.users = users; saveLocal(); }
+      checkAccess(email, errEl, checkEl, btn);
+    }).catch(function() {
+      // Network error - fall back to local cache
+      checkAccess(email, errEl, checkEl, btn);
+    });
+  } else {
+    checkAccess(email, errEl, checkEl, btn);
+  }
 }
 
 function checkAccess(email, errEl, checkEl, btn) {
